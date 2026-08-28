@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 
 from fdtdx.config import SimulationConfig
-from fdtdx.core.grid import UniformGrid
+from fdtdx.core.grid import RectilinearGrid, UniformGrid
 from fdtdx.core.wavelength import WaveCharacter
 from fdtdx.objects.sources.dipole import PointDipoleSource
 
@@ -84,6 +84,15 @@ class TestPointDipoleSourceInitialization:
                 polarization=3,
             )
 
+    def test_invalid_interpolate(self):
+        with pytest.raises(ValueError, match="interpolate must be a bool"):
+            PointDipoleSource(
+                partial_grid_shape=(1, 1, 1),
+                wave_character=WaveCharacter(wavelength=1e-6),
+                polarization=2,
+                interpolate="linear",
+            )
+
     def test_all_polarization_axes(self):
         for axis in (0, 1, 2):
             source = PointDipoleSource(
@@ -118,6 +127,28 @@ class TestPointDipoleSourceUpdateE:
         return source.place_on_grid(
             grid_slice_tuple=((4, 5), (4, 5), (4, 5)),
             config=micro_config,
+            key=jax_key,
+        )
+
+    def _make_interpolated_placed(self, micro_config, jax_key):
+        config = micro_config.aset(
+            "grid",
+            RectilinearGrid.uniform(
+                shape=(8, 8, 8),
+                spacing=1.0,
+                origin=(-4.0, -4.0, -4.0),
+            ),
+        )
+        source = PointDipoleSource(
+            partial_grid_shape=(1, 1, 1),
+            partial_real_position=(0.25, 0.0, 0.0),
+            wave_character=WaveCharacter(wavelength=1e-6),
+            polarization=2,
+            interpolate=True,
+        )
+        return source.place_on_grid(
+            grid_slice_tuple=((4, 5), (4, 5), (4, 5)),
+            config=config,
             key=jax_key,
         )
 
@@ -174,6 +205,111 @@ class TestPointDipoleSourceUpdateE:
         # Zero out the source cell — rest should still be zero
         E_check = E_updated.at[2, 4, 4, 4].set(0.0)
         assert jnp.allclose(E_check, 0.0)
+
+    def test_interpolation_uses_expected_yee_samples_and_weights(self, micro_config, jax_key):
+        placed = self._make_interpolated_placed(micro_config, jax_key)
+        E = jnp.zeros((3, 8, 8, 8), dtype=jnp.float32)
+        inv_perm = jnp.ones_like(E)
+
+        updated = placed.update_E(E, inv_perm, 1.0, jnp.array(10), inverse=False)
+        abs_ez = jnp.abs(updated[2])
+        nonzero = jnp.argwhere(abs_ez > 0)
+        expected = jnp.asarray(
+            [[4, 4, 3], [4, 4, 4], [5, 4, 3], [5, 4, 4]],
+            dtype=nonzero.dtype,
+        )
+
+        assert jnp.array_equal(nonzero, expected)
+        assert jnp.allclose(abs_ez[4, 4, 3], abs_ez[4, 4, 4])
+        assert jnp.allclose(abs_ez[5, 4, 3], abs_ez[5, 4, 4])
+        assert jnp.allclose(abs_ez[4, 4, 3], 3.0 * abs_ez[5, 4, 3])
+
+    def test_interpolation_samples_material_on_each_support(self, micro_config, jax_key):
+        placed = self._make_interpolated_placed(micro_config, jax_key)
+        inv_perm = jnp.ones((3, 8, 8, 8), dtype=jnp.float32)
+        inv_perm = inv_perm.at[2, 5, 4, 3].set(2.0)
+        placed = placed.apply(jax_key, inv_perm, 1.0)
+
+        updated = placed.update_E(
+            jnp.zeros_like(inv_perm),
+            jnp.ones_like(inv_perm),
+            1.0,
+            jnp.array(10),
+            inverse=False,
+        )
+        abs_ez = jnp.abs(updated[2])
+
+        assert jnp.allclose(abs_ez[5, 4, 3], 2.0 * abs_ez[5, 4, 4])
+        assert jnp.allclose(abs_ez[4, 4, 3], 1.5 * abs_ez[5, 4, 3])
+
+    def test_interpolation_supports_jit_and_material_gradient(self, micro_config, jax_key):
+        placed = self._make_interpolated_placed(micro_config, jax_key)
+        E = jnp.zeros((3, 8, 8, 8), dtype=jnp.float32)
+
+        @jax.jit
+        def response(local_inv_perm):
+            inv_perm = jnp.ones_like(E).at[2, 5, 4, 3].set(local_inv_perm)
+            updated = placed.update_E(E, inv_perm, 1.0, jnp.array(10), inverse=False)
+            return jnp.sum(updated[2] ** 2)
+
+        value, gradient = jax.value_and_grad(response)(jnp.asarray(2.0))
+        assert jnp.isfinite(value)
+        assert jnp.isfinite(gradient)
+        assert gradient != 0.0
+
+    def test_interpolation_uses_nonuniform_yee_coordinates(self, micro_config, jax_key):
+        grid = RectilinearGrid(
+            x_edges=jnp.asarray([-4.0, -2.0, 1.0, 4.0]),
+            y_edges=jnp.asarray([-4.0, -1.0, 1.0, 4.0]),
+            z_edges=jnp.asarray([-4.0, -2.0, 2.0, 4.0]),
+        )
+        config = micro_config.aset("grid", grid)
+        source = PointDipoleSource(
+            partial_grid_shape=(1, 1, 1),
+            partial_real_position=(0.0, 0.0, 0.0),
+            wave_character=WaveCharacter(wavelength=1e-6),
+            polarization=2,
+            interpolate=True,
+        ).place_on_grid(((1, 2), (1, 2), (1, 2)), config, jax_key)
+
+        support, weights = source._component_supports()
+        assert support[2] == ((1, 3), (1, 3), (1, 3))
+        assert jnp.allclose(weights[2].sum(), 1.0)
+        assert jnp.allclose(weights[2].sum(axis=(1, 2)), jnp.asarray([1.0 / 3.0, 2.0 / 3.0]))
+
+    def test_interpolation_supports_dispersive_material(self, micro_config, jax_key):
+        config = micro_config.aset(
+            "grid", RectilinearGrid.uniform(shape=(8, 8, 8), spacing=1e-7, origin=(-4e-7, -4e-7, -4e-7))
+        )
+        placed = PointDipoleSource(
+            partial_grid_shape=(1, 1, 1),
+            partial_real_position=(2.5e-8, 0.0, 0.0),
+            wave_character=WaveCharacter(wavelength=1e-6),
+            polarization=2,
+            interpolate=True,
+        ).place_on_grid(((4, 5), (4, 5), (4, 5)), config, jax_key)
+        shape = (3, 8, 8, 8)
+        inv_perm = jnp.ones(shape, dtype=jnp.float32)
+        coeff_shape = (1, *shape)
+        c1 = jnp.full(coeff_shape, 0.4, dtype=jnp.float32)
+        c2 = jnp.full(coeff_shape, 0.2, dtype=jnp.float32)
+        c3 = jnp.full(coeff_shape, 0.1, dtype=jnp.float32)
+        applied = placed.apply(jax_key, inv_perm, 1.0, c1, c2, c3)
+
+        plain = placed.update_E(jnp.zeros(shape), inv_perm, 1.0, jnp.array(10), inverse=False)
+        dispersive = applied.update_E(jnp.zeros(shape), inv_perm, 1.0, jnp.array(10), inverse=False)
+        assert jnp.all(jnp.isfinite(dispersive))
+        assert not jnp.allclose(dispersive, plain)
+
+    def test_interpolation_rejects_non_point_shape(self, micro_config, jax_key):
+        source = PointDipoleSource(
+            partial_grid_shape=(2, 1, 1),
+            wave_character=WaveCharacter(wavelength=1e-6),
+            polarization=2,
+            interpolate=True,
+        )
+        with pytest.raises(ValueError, match="require grid_shape"):
+            source.place_on_grid(((3, 5), (4, 5), (4, 5)), micro_config, jax_key)
 
     def test_axis_aligned_full_tensor_material_keeps_coupled_components(self, micro_config, jax_key):
         placed = self._make_placed(micro_config, jax_key, polarization=0)
@@ -239,6 +375,59 @@ class TestPointDipoleSourceUpdateH:
         H_fwd = placed.update_H(H, inv_perm, 1.0, time_step, inverse=False)
         H_back = placed.update_H(H_fwd, inv_perm, 1.0, time_step, inverse=True)
         assert jnp.allclose(H_back, H, atol=1e-6)
+
+    def test_interpolated_magnetic_dipole_uses_yee_support(self, micro_config, jax_key):
+        config = micro_config.aset(
+            "grid", RectilinearGrid.uniform(shape=(8, 8, 8), spacing=1.0, origin=(-4.0, -4.0, -4.0))
+        )
+        placed = self._make_placed(
+            config,
+            jax_key,
+            partial_real_position=(0.25, 0.0, 0.0),
+            interpolate=True,
+        )
+        H = jnp.zeros((3, 8, 8, 8), dtype=jnp.float32)
+        updated = placed.update_H(H, jnp.ones_like(H), 1.0, jnp.array(10), inverse=False)
+
+        assert jnp.count_nonzero(updated[2]) == 4
+        assert jnp.allclose(updated[0], 0.0)
+        assert jnp.allclose(updated[1], 0.0)
+
+    def test_interpolated_magnetic_dipole_samples_each_support(self, micro_config, jax_key):
+        config = micro_config.aset(
+            "grid", RectilinearGrid.uniform(shape=(8, 8, 8), spacing=1.0, origin=(-4.0, -4.0, -4.0))
+        )
+        placed = self._make_placed(
+            config,
+            jax_key,
+            partial_real_position=(0.25, 0.0, 0.0),
+            interpolate=True,
+        )
+        inv_mu = jnp.ones((3, 8, 8, 8), dtype=jnp.float32).at[2, 5, 3, 4].set(2.0)
+        applied = placed.apply(jax_key, jnp.ones_like(inv_mu), inv_mu)
+        updated = applied.update_H(jnp.zeros_like(inv_mu), jnp.ones_like(inv_mu), inv_mu, jnp.array(10), False)
+
+        abs_hz = jnp.abs(updated[2])
+        assert jnp.max(abs_hz) > jnp.min(abs_hz[abs_hz > 0])
+
+
+class TestPointDipoleInterpolatedOrientation:
+    def test_tilted_dipole_uses_component_specific_supports(self, micro_config, jax_key):
+        config = micro_config.aset(
+            "grid", RectilinearGrid.uniform(shape=(8, 8, 8), spacing=1.0, origin=(-4.0, -4.0, -4.0))
+        )
+        source = PointDipoleSource(
+            partial_grid_shape=(1, 1, 1),
+            partial_real_position=(0.25, 0.25, 0.25),
+            wave_character=WaveCharacter(wavelength=1e-6),
+            polarization=2,
+            azimuth_angle=35.0,
+            elevation_angle=20.0,
+            interpolate=True,
+        ).place_on_grid(((4, 5), (4, 5), (4, 5)), config, jax_key)
+        field = source.update_E(jnp.zeros((3, 8, 8, 8)), jnp.ones((3, 8, 8, 8)), 1.0, jnp.array(10), False)
+
+        assert all(int(jnp.count_nonzero(field[axis])) == 8 for axis in range(3))
 
 
 class TestPointDipoleArbitraryOrientation:

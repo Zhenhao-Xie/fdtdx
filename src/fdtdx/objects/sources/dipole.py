@@ -4,12 +4,16 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from fdtdx.config import SimulationConfig
 from fdtdx.core.axis import get_oriented_transverse_axes
+from fdtdx.core.grid import RectilinearGrid
 from fdtdx.core.jax.pytrees import autoinit, frozen_field, private_field
 from fdtdx.core.linalg import rotate_vector
+from fdtdx.core.misc import ensure_slice_tuple
 from fdtdx.core.null import Null
 from fdtdx.dispersion import effective_inv_permittivity
 from fdtdx.objects.sources.source import Source
+from fdtdx.typing import SliceTuple3D
 
 
 def _contract_orientation(
@@ -48,13 +52,63 @@ def _axis_aligned_diagonal_injection(
     return inv_material.shape[0] in (1, 3)
 
 
+def _support_from_coordinates(
+    coordinates: np.ndarray,
+    position: float,
+) -> tuple[tuple[int, int], jax.Array]:
+    """Return linear interpolation support on a Yee coordinate axis."""
+    if coordinates.ndim != 1 or coordinates.size == 0:
+        raise ValueError("Source interpolation coordinates must be a nonempty 1D array")
+
+    if coordinates.size == 1:
+        return (0, 1), jnp.ones((1,), dtype=jnp.float32)
+
+    if position <= coordinates[0]:
+        return (0, 2), jnp.asarray([1.0, 0.0], dtype=jnp.float32)
+    if position >= coordinates[-1]:
+        return (
+            (coordinates.size - 2, coordinates.size),
+            jnp.asarray([0.0, 1.0], dtype=jnp.float32),
+        )
+
+    upper = int(np.searchsorted(coordinates, position, side="right"))
+    lower = upper - 1
+    upper_weight = float((position - coordinates[lower]) / (coordinates[upper] - coordinates[lower]))
+    return (
+        (lower, upper + 1),
+        jnp.asarray([1.0 - upper_weight, upper_weight], dtype=jnp.float32),
+    )
+
+
+def _field_component_coordinates(
+    grid: RectilinearGrid,
+    source_type: Literal["electric", "magnetic"],
+    component_axis: int,
+    coordinate_axis: int,
+) -> np.ndarray:
+    """Return the physical Yee coordinates of one field component."""
+    electric_centered = source_type == "electric" and coordinate_axis == component_axis
+    magnetic_centered = source_type == "magnetic" and coordinate_axis != component_axis
+    if electric_centered or magnetic_centered:
+        return np.asarray(grid.centers(coordinate_axis))
+    return np.asarray(grid.edges(coordinate_axis)[:-1])
+
+
+def _outer_product_weights(axis_weights: tuple[jax.Array, jax.Array, jax.Array]) -> jax.Array:
+    """Build a separable 3D interpolation stencil."""
+    wx, wy, wz = axis_weights
+    return wx[:, None, None] * wy[None, :, None] * wz[None, None, :]
+
+
 @autoinit
 class PointDipoleSource(Source):
     """Soft point dipole source (electric or magnetic).
 
-    Injects an impressed current at a single Yee cell. The source is "soft":
-    it adds to the field rather than overwriting, so scattered/reflected fields
-    pass through without artificial reflections.
+    Injects an impressed current into the Yee grid. With ``interpolate=False`` (the default), the
+    current is applied at one grid sample for backward compatibility. With ``interpolate=True``,
+    the continuous source position is distributed linearly over the neighboring, component-specific
+    Yee samples. The source is "soft": it adds to the field rather than overwriting, so
+    scattered/reflected fields pass through without artificial reflections.
 
     The dipole orientation starts along the ``polarization`` axis and is then
     rotated by ``azimuth_angle`` and ``elevation_angle`` (both in degrees),
@@ -75,10 +129,9 @@ class PointDipoleSource(Source):
     For a magnetic dipole, the dual applies during the H update with
     inv_permeability replacing inv_permittivity.
 
-    The medium permittivity/permeability at the source cell is sampled once
-    during :meth:`apply` — at the carrier angular frequency when a dispersive
-    coefficient arrays is provided — so dispersive media are handled correctly
-    without runtime overhead.
+    The medium permittivity/permeability is sampled once during :meth:`apply` at every injection
+    sample used by the selected mode. Dispersive coefficients are evaluated at the carrier angular
+    frequency, so dispersive media are handled without runtime material lookups.
     """
 
     #: Polarization axis (0=x, 1=y, 2=z).
@@ -96,16 +149,26 @@ class PointDipoleSource(Source):
     #: Source amplitude.
     amplitude: float = frozen_field(default=1.0)
 
+    #: Distribute a continuous source position onto neighboring Yee samples.
+    #: Disabled by default to preserve the legacy single-cell source behavior.
+    interpolate: bool = frozen_field(default=False)
+
     _inv_eps_local: jax.Array = private_field()
     _inv_mu_local: jax.Array | float = private_field()
     _inv_eps_oriented: jax.Array = private_field()
     _inv_mu_oriented: jax.Array = private_field()
+    _source_support_slices: tuple[SliceTuple3D, SliceTuple3D, SliceTuple3D] = private_field()
+    _source_weights: tuple[jax.Array, jax.Array, jax.Array] = private_field()
+    _inv_eps_oriented_components: tuple[jax.Array, jax.Array, jax.Array] = private_field()
+    _inv_mu_oriented_components: tuple[jax.Array, jax.Array, jax.Array] = private_field()
 
     def __post_init__(self):
         if self.source_type not in ("electric", "magnetic"):
             raise ValueError(f"source_type must be electric or magnetic, got {self.source_type}")
         if self.polarization not in (0, 1, 2):
             raise ValueError(f"polarization must be 0, 1, or 2, got {self.polarization}")
+        if not isinstance(self.interpolate, bool):
+            raise ValueError(f"interpolate must be a bool, got {self.interpolate!r}")
 
     def validate_placement(self, objects) -> list[str]:
         """Reject a dipole sitting on a symmetry plane.
@@ -127,6 +190,86 @@ class PointDipoleSource(Source):
             )
         return errors
 
+    def _requested_position(self, grid: RectilinearGrid) -> tuple[float, float, float]:
+        """Return the requested continuous position in resolved-grid coordinates."""
+        position = []
+        for axis in range(3):
+            real_position = self.partial_real_position[axis]
+            edges = grid.edges(axis)
+            domain_center = 0.5 * (float(edges[0]) + float(edges[-1]))
+            if real_position is None:
+                start, stop = self.grid_slice_tuple[axis]
+                local_edges = grid.edges(axis)[start : stop + 1]
+                position.append(0.5 * (float(local_edges[0]) + float(local_edges[-1])))
+            else:
+                position.append(domain_center + float(real_position))
+        return position[0], position[1], position[2]
+
+    def _single_cell_support(
+        self,
+    ) -> tuple[
+        tuple[SliceTuple3D, SliceTuple3D, SliceTuple3D],
+        tuple[jax.Array, jax.Array, jax.Array],
+    ]:
+        support_slices = (
+            self.grid_slice_tuple,
+            self.grid_slice_tuple,
+            self.grid_slice_tuple,
+        )
+        weight = jnp.ones(self.grid_shape, dtype=self._config.dtype)
+        return support_slices, (weight, weight, weight)
+
+    def _interpolated_support(
+        self, grid: RectilinearGrid
+    ) -> tuple[
+        tuple[SliceTuple3D, SliceTuple3D, SliceTuple3D],
+        tuple[jax.Array, jax.Array, jax.Array],
+    ]:
+        source_position = self._requested_position(grid)
+        support_slices: list[SliceTuple3D] = []
+        support_weights = []
+        for component_axis in range(3):
+            axis_bounds = []
+            axis_weights = []
+            for coordinate_axis in range(3):
+                coordinates = _field_component_coordinates(grid, self.source_type, component_axis, coordinate_axis)
+                bounds, weights = _support_from_coordinates(coordinates, source_position[coordinate_axis])
+                axis_bounds.append(bounds)
+                axis_weights.append(weights.astype(self._config.dtype))
+            support_slices.append((axis_bounds[0], axis_bounds[1], axis_bounds[2]))
+            support_weights.append(_outer_product_weights((axis_weights[0], axis_weights[1], axis_weights[2])))
+        return (
+            (support_slices[0], support_slices[1], support_slices[2]),
+            (support_weights[0], support_weights[1], support_weights[2]),
+        )
+
+    def place_on_grid(
+        self: Self,
+        grid_slice_tuple: SliceTuple3D,
+        config: SimulationConfig,
+        key: jax.Array,
+    ) -> Self:
+        self = super().place_on_grid(grid_slice_tuple, config, key)
+        grid = self._config.resolved_grid
+        if self.interpolate and self.grid_shape != (1, 1, 1):
+            raise ValueError(f"Interpolated point dipoles require grid_shape=(1, 1, 1), got {self.grid_shape}")
+        if self.interpolate and grid is not None:
+            support_slices, support_weights = self._interpolated_support(grid)
+        else:
+            support_slices, support_weights = self._single_cell_support()
+        self = self.aset("_source_support_slices", support_slices, create_new_ok=True)
+        return self.aset("_source_weights", support_weights, create_new_ok=True)
+
+    def _component_supports(
+        self,
+    ) -> tuple[
+        tuple[SliceTuple3D, SliceTuple3D, SliceTuple3D],
+        tuple[jax.Array, jax.Array, jax.Array],
+    ]:
+        if isinstance(self._source_support_slices, Null) or isinstance(self._source_weights, Null):
+            return self._single_cell_support()
+        return self._source_support_slices, self._source_weights
+
     @property
     def _orientation(self) -> jnp.ndarray:
         """Normalized orientation vector as a (3,) JAX array.
@@ -147,6 +290,60 @@ class PointDipoleSource(Source):
             axes_tuple=axes_tuple,
         )
 
+    def _oriented_components_from_material(
+        self,
+        material: jax.Array | float,
+        support_slices: tuple[SliceTuple3D, SliceTuple3D, SliceTuple3D],
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        """Sample and contract a material independently on each Yee support."""
+        components = []
+        for axis, support_slice in enumerate(support_slices):
+            if isinstance(material, jax.Array) and material.ndim > 0:
+                material_slice: jax.Array | float = material[:, *ensure_slice_tuple(support_slice)]
+            else:
+                material_slice = material
+            components.append(_contract_orientation(material_slice, self._orientation)[axis])
+        return components[0], components[1], components[2]
+
+    def _effective_inv_eps_components(
+        self,
+        inv_permittivities: jax.Array,
+        support_slices: tuple[SliceTuple3D, SliceTuple3D, SliceTuple3D],
+        dispersive_c1: jax.Array | None,
+        dispersive_c2: jax.Array | None,
+        dispersive_c3: jax.Array | None,
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        """Sample effective inverse permittivity on each electric support."""
+        components = []
+        for axis, support_slice in enumerate(support_slices):
+            source_slice = ensure_slice_tuple(support_slice)
+            inv_eps_slice = inv_permittivities[:, *source_slice]
+            if dispersive_c1 is not None and dispersive_c2 is not None and dispersive_c3 is not None:
+                inv_eps_slice = effective_inv_permittivity(
+                    inv_eps=inv_eps_slice,
+                    c1=dispersive_c1[:, :, *source_slice],
+                    c2=dispersive_c2[:, :, *source_slice],
+                    c3=dispersive_c3[:, :, *source_slice],
+                    omega=2.0 * np.pi * self.wave_character.get_frequency(),
+                    dt=self._config.time_step_duration,
+                )
+            components.append(_contract_orientation(inv_eps_slice, self._orientation)[axis])
+        return components[0], components[1], components[2]
+
+    def _inject_interpolated(
+        self,
+        field: jax.Array,
+        oriented_components: tuple[jax.Array, jax.Array, jax.Array],
+        scale: jax.Array,
+        sign: float,
+    ) -> jax.Array:
+        """Add a weighted source contribution to each component-specific support."""
+        support_slices, weights = self._component_supports()
+        for axis in range(3):
+            injection = scale * oriented_components[axis] * weights[axis]
+            field = field.at[axis, *ensure_slice_tuple(support_slices[axis])].add(sign * injection.astype(field.dtype))
+        return field
+
     def apply(
         self: Self,
         key: jax.Array,
@@ -159,7 +356,20 @@ class PointDipoleSource(Source):
     ) -> Self:
         del key, electric_conductivity
 
-        # inv_permittivities shape: (num_components, Nx, Ny, Nz)
+        if self.interpolate:
+            support_slices, _ = self._component_supports()
+            if self.source_type == "electric":
+                inv_eps_components = self._effective_inv_eps_components(
+                    inv_permittivities,
+                    support_slices,
+                    dispersive_c1,
+                    dispersive_c2,
+                    dispersive_c3,
+                )
+                return self.aset("_inv_eps_oriented_components", inv_eps_components, create_new_ok=True)
+            inv_mu_components = self._oriented_components_from_material(inv_permeabilities, support_slices)
+            return self.aset("_inv_mu_oriented_components", inv_mu_components, create_new_ok=True)
+
         inv_eps_slice = inv_permittivities[:, *self.grid_slice]
 
         if dispersive_c1 is not None and dispersive_c2 is not None and dispersive_c3 is not None:
@@ -211,6 +421,21 @@ class PointDipoleSource(Source):
         )
 
         sign = -1.0 if not inverse else 1.0
+        scale = c * self.amplitude * self.static_amplitude_factor * amplitude
+
+        if self.interpolate:
+            support_slices, _ = self._component_supports()
+            if isinstance(self._inv_eps_oriented_components, Null):
+                oriented_components = self._effective_inv_eps_components(
+                    inv_permittivities,
+                    support_slices,
+                    dispersive_c1=None,
+                    dispersive_c2=None,
+                    dispersive_c3=None,
+                )
+            else:
+                oriented_components = self._inv_eps_oriented_components
+            return self._inject_interpolated(E, oriented_components, scale, sign)
 
         if isinstance(self._inv_eps_oriented, Null):
             inv_eps_source = inv_permittivities[:, *self.grid_slice]
@@ -219,7 +444,6 @@ class PointDipoleSource(Source):
             inv_eps_source = self._inv_eps_local
             inv_eps_oriented = self._inv_eps_oriented
 
-        scale = c * self.amplitude * self.static_amplitude_factor * amplitude
         if _axis_aligned_diagonal_injection(inv_eps_source, self.azimuth_angle, self.elevation_angle):
             injection = scale * inv_eps_oriented[self.polarization]
             E = E.at[self.polarization, *self.grid_slice].add(sign * injection.astype(E.dtype))
@@ -252,6 +476,15 @@ class PointDipoleSource(Source):
         )
 
         sign = -1.0 if not inverse else 1.0
+        scale = c * self.amplitude * self.static_amplitude_factor * amplitude
+
+        if self.interpolate:
+            support_slices, _ = self._component_supports()
+            if isinstance(self._inv_mu_oriented_components, Null):
+                oriented_components = self._oriented_components_from_material(inv_permeabilities, support_slices)
+            else:
+                oriented_components = self._inv_mu_oriented_components
+            return self._inject_interpolated(H, oriented_components, scale, sign)
 
         if isinstance(self._inv_mu_oriented, Null):
             inv_mu_source: jax.Array | float = inv_permeabilities
@@ -262,7 +495,6 @@ class PointDipoleSource(Source):
             inv_mu_source = self._inv_mu_local
             inv_mu_oriented = self._inv_mu_oriented
 
-        scale = c * self.amplitude * self.static_amplitude_factor * amplitude
         if _axis_aligned_diagonal_injection(inv_mu_source, self.azimuth_angle, self.elevation_angle):
             injection = scale * inv_mu_oriented[self.polarization]
             H = H.at[self.polarization, *self.grid_slice].add(sign * injection.astype(H.dtype))
