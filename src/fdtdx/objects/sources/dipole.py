@@ -266,8 +266,6 @@ class PointDipoleSource(Source):
         tuple[SliceTuple3D, SliceTuple3D, SliceTuple3D],
         tuple[jax.Array, jax.Array, jax.Array],
     ]:
-        if isinstance(self._source_support_slices, Null) or isinstance(self._source_weights, Null):
-            return self._single_cell_support()
         return self._source_support_slices, self._source_weights
 
     @property

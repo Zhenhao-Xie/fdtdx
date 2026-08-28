@@ -12,7 +12,7 @@ import pytest
 from fdtdx.config import SimulationConfig
 from fdtdx.core.grid import RectilinearGrid, UniformGrid
 from fdtdx.core.wavelength import WaveCharacter
-from fdtdx.objects.sources.dipole import PointDipoleSource
+from fdtdx.objects.sources.dipole import PointDipoleSource, _support_from_coordinates
 
 
 @pytest.fixture
@@ -112,6 +112,21 @@ class TestPointDipoleSourceInitialization:
         )
         assert source.azimuth_angle == 30.0
         assert source.elevation_angle == 15.0
+
+    def test_interpolation_support_handles_degenerate_and_boundary_axes(self):
+        for invalid_coordinates in (np.asarray([]), np.ones((1, 2))):
+            with pytest.raises(ValueError, match="nonempty 1D array"):
+                _support_from_coordinates(invalid_coordinates, 0.0)
+
+        cases = (
+            (np.asarray([1.0]), 1.0, (0, 1), [1.0]),
+            (np.asarray([1.0, 2.0, 3.0]), 0.0, (0, 2), [1.0, 0.0]),
+            (np.asarray([1.0, 2.0, 3.0]), 4.0, (1, 3), [0.0, 1.0]),
+        )
+        for coordinates, position, expected_bounds, expected_weights in cases:
+            bounds, weights = _support_from_coordinates(coordinates, position)
+            assert bounds == expected_bounds
+            assert jnp.allclose(weights, jnp.asarray(expected_weights))
 
 
 class TestPointDipoleSourceUpdateE:
@@ -266,7 +281,6 @@ class TestPointDipoleSourceUpdateE:
         config = micro_config.aset("grid", grid)
         source = PointDipoleSource(
             partial_grid_shape=(1, 1, 1),
-            partial_real_position=(0.0, 0.0, 0.0),
             wave_character=WaveCharacter(wavelength=1e-6),
             polarization=2,
             interpolate=True,
@@ -275,7 +289,7 @@ class TestPointDipoleSourceUpdateE:
         support, weights = source._component_supports()
         assert support[2] == ((1, 3), (1, 3), (1, 3))
         assert jnp.allclose(weights[2].sum(), 1.0)
-        assert jnp.allclose(weights[2].sum(axis=(1, 2)), jnp.asarray([1.0 / 3.0, 2.0 / 3.0]))
+        assert jnp.allclose(weights[2].sum(axis=(1, 2)), jnp.asarray([0.5, 0.5]))
 
     def test_interpolation_supports_dispersive_material(self, micro_config, jax_key):
         config = micro_config.aset(
@@ -403,12 +417,12 @@ class TestPointDipoleSourceUpdateH:
             partial_real_position=(0.25, 0.0, 0.0),
             interpolate=True,
         )
-        inv_mu = jnp.ones((3, 8, 8, 8), dtype=jnp.float32).at[2, 5, 3, 4].set(2.0)
+        inv_mu = jnp.ones((3, 8, 8, 8), dtype=jnp.float32).at[2, 3, 3, 4].set(2.0)
         applied = placed.apply(jax_key, jnp.ones_like(inv_mu), inv_mu)
         updated = applied.update_H(jnp.zeros_like(inv_mu), jnp.ones_like(inv_mu), inv_mu, jnp.array(10), False)
 
         abs_hz = jnp.abs(updated[2])
-        assert jnp.max(abs_hz) > jnp.min(abs_hz[abs_hz > 0])
+        assert jnp.allclose(abs_hz[3, 3, 4], 2.0 * abs_hz[3, 4, 4])
 
 
 class TestPointDipoleInterpolatedOrientation:
